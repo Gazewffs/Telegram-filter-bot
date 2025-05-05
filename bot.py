@@ -1,0 +1,461 @@
+import logging
+import asyncio
+import re
+import os
+import json
+from telegram import Bot, Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes
+)
+from config import BOT_TOKEN, PROCESS_TEXT, PROCESS_CAPTIONS, REPLY_ON_EDIT_FAILURE
+from utils import process_message_text
+from filter_manager import add_filter, remove_filter, list_filters, test_filter
+
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    filename='bot.log'
+)
+
+logger = logging.getLogger(__name__)
+
+# File to store channels list
+CHANNELS_FILE = "monitored_channels.json"
+
+def load_channels():
+    """Load the list of channels to monitor from a JSON file."""
+    if not os.path.exists(CHANNELS_FILE):
+        # Create empty list with default channel from env var
+        channels = []
+        channel_id = os.environ.get("CHANNEL_ID")
+        if channel_id:
+            channels.append(channel_id)
+        save_channels(channels)
+        return channels
+    
+    try:
+        with open(CHANNELS_FILE, 'r') as f:
+            channels = json.load(f)
+            return channels
+    except Exception as e:
+        logger.error(f"Error loading channels: {e}")
+        return []
+
+def save_channels(channels):
+    """Save the list of channels to monitor to a JSON file."""
+    try:
+        with open(CHANNELS_FILE, 'w') as f:
+            json.dump(channels, f, indent=2)
+        return True
+    except Exception as e:
+        logger.error(f"Error saving channels: {e}")
+        return False
+
+def add_channel(channel_id):
+    """Add a channel to the list of monitored channels."""
+    channels = load_channels()
+    
+    # Normalize channel ID format
+    if channel_id.startswith('@'):
+        # Keep @ for usernames
+        normalized_id = channel_id
+    else:
+        # Ensure numeric IDs are strings without @
+        normalized_id = str(channel_id).replace('@', '')
+    
+    # Check if channel already exists
+    if normalized_id in channels:
+        return False, "Channel already in monitoring list."
+    
+    channels.append(normalized_id)
+    if save_channels(channels):
+        return True, f"Channel {normalized_id} added to monitoring list."
+    else:
+        return False, "Failed to save channel."
+
+def remove_channel(channel_id):
+    """Remove a channel from the list of monitored channels."""
+    channels = load_channels()
+    initial_count = len(channels)
+    
+    # Normalize channel ID for comparison
+    normalized_id = str(channel_id).replace('@', '') if not channel_id.startswith('@') else channel_id
+    
+    # Check both formats (@username and username) for removal
+    if normalized_id in channels:
+        channels.remove(normalized_id)
+    elif f"@{normalized_id}" in channels:
+        channels.remove(f"@{normalized_id}")
+    elif normalized_id.replace('@', '') in channels:
+        channels.remove(normalized_id.replace('@', ''))
+    
+    if len(channels) < initial_count:
+        if save_channels(channels):
+            return True, f"Channel {channel_id} removed from monitoring list."
+    
+    return False, f"Channel {channel_id} not found in monitoring list."
+
+def list_channels():
+    """Get a formatted list of all monitored channels."""
+    channels = load_channels()
+    
+    if not channels:
+        return "No channels are being monitored."
+    
+    result = "Monitored channels:\n\n"
+    for i, channel in enumerate(channels, 1):
+        result += f"{i}. `{channel}`\n"
+    
+    return result
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a message when the command /start is issued."""
+    await update.message.reply_text(
+        "👋 Hi! I'm a channel message editor bot. I automatically edit messages in the configured channels.\n\n"
+        "I apply text filters and convert timestamps between timezones.\n\n"
+        "Add me to your channel as an admin with edit permissions to get started.\n\n"
+        "Type /help to see available commands."
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a message when the command /help is issued."""
+    await update.message.reply_text(
+        "🤖 *How to use this bot:*\n\n"
+        "1️⃣ Add this bot to your channel as an admin\n"
+        "2️⃣ Give it permission to post and edit messages\n"
+        "3️⃣ Add your channel to the bot's monitoring list\n"
+        "4️⃣ The bot will automatically edit new messages to apply text filters and convert timestamps\n\n"
+        "*Channel management commands:*\n"
+        "/channels - List all monitored channels\n"
+        "/addchannel channel_id - Add a channel to monitor\n"
+        "/removechannel channel_id - Remove a channel from monitoring\n\n"
+        "*Filter management commands:*\n"
+        "/filters - List all current text filters\n"
+        "/addfilter pattern replacement - Add a new filter\n"
+        "/removefilter pattern - Remove a filter\n"
+        "/testfilter sample_text regex_pattern - Test a regex pattern on sample text",
+        parse_mode="Markdown"
+    )
+
+async def process_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process new channel posts."""
+    message = update.channel_post
+    
+    if not message:
+        return
+    
+    # Check if the message is from a monitored channel
+    monitored_channels = load_channels()
+    channel_match = False
+    
+    for channel in monitored_channels:
+        # Handle both username format (@channel) and numeric ID format
+        if channel.startswith('@'):
+            # Username format - compare with channel username
+            if message.chat.username and message.chat.username.lower() == channel.replace('@', '').lower():
+                channel_match = True
+                break
+        else:
+            # Numeric ID format - compare with channel ID
+            if message.chat.id and str(message.chat.id) == channel:
+                channel_match = True
+                break
+    
+    if not channel_match and monitored_channels:
+        logger.info(f"Ignoring message from non-monitored channel: {message.chat.id}")
+        return
+    
+    logger.info(f"Processing message {message.message_id} from channel {message.chat.id}")
+    
+    try:
+        # Process text messages
+        if message.text and PROCESS_TEXT:
+            original_text = message.text
+            logger.info(f"Original text before processing: '{original_text}'")
+            
+            processed_text = process_message_text(original_text)
+            logger.info(f"Processed text after filters and time conversion: '{processed_text}'")
+            
+            # Only edit if the text has changed
+            if processed_text != original_text:
+                logger.info(f"Text was changed! Will attempt to edit message {message.message_id}")
+                try:
+                    # Try to edit message directly
+                    await message.edit_text(processed_text, entities=message.entities)
+                    logger.info(f"Edited text message {message.message_id}")
+                except Exception as edit_error:
+                    # If editing fails (e.g., no permission), try alternative method
+                    logger.warning(f"Could not edit message directly: {edit_error}")
+                    
+                    try:
+                        # Try using bot API directly with context.bot
+                        await context.bot.edit_message_text(
+                            chat_id=message.chat.id,
+                            message_id=message.message_id,
+                            text=processed_text,
+                            entities=message.entities
+                        )
+                        logger.info(f"Edited text message {message.message_id} using bot API")
+                    except Exception as api_error:
+                        # If that also fails, log detailed error
+                        logger.error(f"Failed to edit message {message.message_id}: {api_error}")
+                        
+                        # If both editing methods fail, create a reply that shows what the text should be
+                        if REPLY_ON_EDIT_FAILURE:
+                            try:
+                                await context.bot.send_message(
+                                    chat_id=message.chat.id,
+                                    text=f"*Message text should be:*\n\n{processed_text}",
+                                    parse_mode="Markdown",
+                                    reply_to_message_id=message.message_id
+                                )
+                                logger.info(f"Sent reply with corrected text for message {message.message_id}")
+                            except Exception as reply_error:
+                                logger.error(f"Failed to send reply: {reply_error}")
+            else:
+                logger.info(f"No changes needed for message {message.message_id}")
+        
+        # Process captions in media messages
+        elif message.caption and PROCESS_CAPTIONS:
+            original_caption = message.caption
+            processed_caption = process_message_text(original_caption)
+            
+            # Only edit if the caption has changed
+            if processed_caption != original_caption:
+                try:
+                    # Try to edit caption directly
+                    await message.edit_caption(processed_caption, caption_entities=message.caption_entities)
+                    logger.info(f"Edited caption in message {message.message_id}")
+                except Exception as edit_error:
+                    # If editing fails, try alternative method
+                    logger.warning(f"Could not edit caption directly: {edit_error}")
+                    
+                    try:
+                        # Try using bot API directly
+                        await context.bot.edit_message_caption(
+                            chat_id=message.chat.id,
+                            message_id=message.message_id,
+                            caption=processed_caption,
+                            caption_entities=message.caption_entities
+                        )
+                        logger.info(f"Edited caption in message {message.message_id} using bot API")
+                    except Exception as api_error:
+                        # If that also fails, log detailed error
+                        logger.error(f"Failed to edit caption in message {message.message_id}: {api_error}")
+                        
+                        # If both editing methods fail, create a reply that shows what the caption should be
+                        if REPLY_ON_EDIT_FAILURE:
+                            try:
+                                await context.bot.send_message(
+                                    chat_id=message.chat.id,
+                                    text=f"*Caption should be:*\n\n{processed_caption}",
+                                    parse_mode="Markdown",
+                                    reply_to_message_id=message.message_id
+                                )
+                                logger.info(f"Sent reply with corrected caption for message {message.message_id}")
+                            except Exception as reply_error:
+                                logger.error(f"Failed to send reply: {reply_error}")
+                
+    except Exception as e:
+        logger.error(f"Error processing message {message.message_id}: {e}")
+
+async def filters_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Display all current filters."""
+    filters_text = list_filters()
+    await update.message.reply_text(filters_text, parse_mode="Markdown")
+
+async def add_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a new filter."""
+    # Check arguments
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "❌ Usage: /addfilter pattern replacement\n\n"
+            "Example: /addfilter (?i)\\b(hello)\\b HELLO\n\n"
+            "This would replace all instances of 'hello' (case insensitive) with 'HELLO'"
+        )
+        return
+    
+    # Get pattern and replacement
+    pattern = context.args[0]
+    replacement = ' '.join(context.args[1:])
+    
+    try:
+        # Test if pattern is valid regex
+        re.compile(pattern)
+        
+        # Add the filter
+        if add_filter(pattern, replacement):
+            await update.message.reply_text(
+                f"✅ Filter added successfully!\n\n"
+                f"Pattern: `{pattern}`\n"
+                f"Replacement: `{replacement}`",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text("❌ Failed to add filter.")
+    except re.error as e:
+        await update.message.reply_text(f"❌ Invalid regex pattern: {e}")
+
+async def remove_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove a filter."""
+    # Check arguments
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Usage: /removefilter pattern\n\n"
+            "Example: /removefilter (?i)\\b(hello)\\b"
+        )
+        return
+    
+    pattern = context.args[0]
+    
+    # Remove the filter
+    if remove_filter(pattern):
+        await update.message.reply_text(f"✅ Filter with pattern `{pattern}` removed.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"❌ No filter found with pattern `{pattern}`.", parse_mode="Markdown")
+
+async def test_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test a regex pattern on sample text."""
+    # Check arguments
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "❌ Usage: /testfilter sample_text pattern\n\n"
+            "Example: /testfilter \"Hello world\" (?i)\\b(hello)\\b"
+        )
+        return
+    
+    sample_text = context.args[0]
+    pattern = context.args[1]
+    
+    try:
+        # Test the pattern
+        result = test_filter(sample_text, pattern)
+        await update.message.reply_text(f"Test result:\n\n{result}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error testing pattern: {e}")
+
+async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Display all monitored channels."""
+    channels_text = list_channels()
+    await update.message.reply_text(channels_text, parse_mode="Markdown")
+
+async def add_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a channel to monitor."""
+    # Check arguments
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Usage: /addchannel channel_id\n\n"
+            "Examples:\n"
+            "/addchannel @channelname\n"
+            "/addchannel -1001234567890"
+        )
+        return
+    
+    channel_id = context.args[0]
+    
+    # Add the channel
+    success, message = add_channel(channel_id)
+    if success:
+        await update.message.reply_text(f"✅ {message}")
+    else:
+        await update.message.reply_text(f"❌ {message}")
+
+async def remove_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove a channel from monitoring."""
+    # Check arguments
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Usage: /removechannel channel_id\n\n"
+            "Examples:\n"
+            "/removechannel @channelname\n"
+            "/removechannel -1001234567890"
+        )
+        return
+    
+    channel_id = context.args[0]
+    
+    # Remove the channel
+    success, message = remove_channel(channel_id)
+    if success:
+        await update.message.reply_text(f"✅ {message}")
+    else:
+        await update.message.reply_text(f"❌ {message}")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Display bot status."""
+    from config import SOURCE_TIMEZONE, TARGET_TIMEZONE
+    
+    channels = list_channels().replace('`', '')
+    filters_text = list_filters().replace('`', '')
+    
+    status_text = (
+        "📊 *Bot Status*\n\n"
+        "✅ Bot is running and monitoring channels\n\n"
+        f"*Source Timezone:* {SOURCE_TIMEZONE}\n"
+        f"*Target Timezone:* {TARGET_TIMEZONE}\n\n"
+        f"*Monitored Channels:*\n{channels}\n\n"
+        f"*Active Filters:*\n{filters_text}"
+    )
+    
+    await update.message.reply_text(status_text, parse_mode="Markdown")
+
+async def start_bot_async():
+    """Start the Telegram bot asynchronously."""
+    if not BOT_TOKEN:
+        logger.error("No bot token provided! Please set the TELEGRAM_BOT_TOKEN environment variable.")
+        return
+    
+    # Create application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Register command handlers
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("filters", filters_command))
+    application.add_handler(CommandHandler("addfilter", add_filter_command))
+    application.add_handler(CommandHandler("removefilter", remove_filter_command))
+    application.add_handler(CommandHandler("testfilter", test_filter_command))
+    application.add_handler(CommandHandler("channels", channels_command))
+    application.add_handler(CommandHandler("addchannel", add_channel_command))
+    application.add_handler(CommandHandler("removechannel", remove_channel_command))
+    
+    # Register message handler for channel posts
+    application.add_handler(MessageHandler(filters.ChatType.CHANNEL, process_channel_post))
+    
+    # Start the bot
+    logger.info("Starting bot...")
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    logger.info("Bot started and polling")
+    
+    # Keep the bot running
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopping...")
+    finally:
+        await application.stop()
+        await application.shutdown()
+        logger.info("Bot stopped")
+
+def main():
+    """Main function to start the bot."""
+    try:
+        asyncio.run(start_bot_async())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Error starting bot: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
