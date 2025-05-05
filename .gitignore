@@ -1,0 +1,7 @@
+# Create a .gitignore file
+echo "# Ignored files
+bot.log
+__pycache__/
+*.pyc
+.env
+" > termux_bot/.gitignore
